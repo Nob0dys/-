@@ -89,6 +89,19 @@ def is_saitel(source_file: object) -> bool:
     return SAITEL_MARK in str(source_file or "")
 
 
+def is_customer_exclusive(record: dict) -> bool:
+    """客户专属报价单行（HistoryQuote.customer_id 非空）。"""
+    return record.get("customer_id") is not None
+
+
+def _autoselect_floor(record: dict) -> float:
+    """默认选中/入选下限：赛特尔价目本与客户专属价目按受信来源放宽到
+    SAITEL_FLOOR，其余公共来源用 AUTOSELECT_FLOOR。"""
+    if is_saitel(record.get("source_file")) or is_customer_exclusive(record):
+        return SAITEL_FLOOR
+    return AUTOSELECT_FLOOR
+
+
 def robust_median(prices: list[float]) -> float:
     """截尾稳健中位数：去掉最高 25% 的离群高价后取中位数，防止
     包1-4 等高价来源污染同核心词组的价格基准。"""
@@ -396,6 +409,7 @@ def _history_dict(record: HistoryQuote) -> dict:
         "quote_date": record.quote_date,
         "source_priority": record.source_priority,
         "data_quality": record.data_quality,
+        "customer_id": record.customer_id,
     }
 
 
@@ -412,7 +426,22 @@ def process_job(job_id: str) -> None:
         parsed_lines = parse_quote_workbook(job.source_file_path)
         db.execute(delete(QuoteLine).where(QuoteLine.job_id == job_id))
         db.commit()
-        history = [_history_dict(item) for item in db.scalars(select(HistoryQuote)).all()]
+        all_history = [_history_dict(item) for item in db.scalars(select(HistoryQuote)).all()]
+        # 候选池 = 公共历史库（customer_id 为空）+ 本任务客户的专属价目行；
+        # 其它客户的专属行直接丢弃，绝不进入本任务候选池。
+        # 缓存安全性：matching.py 的全部缓存（normalize_text/bigram_dice/
+        # name_core/parameter_similarity/_spec_features/category 推断等）都是
+        # 以字符串内容为键的 lru_cache 纯函数缓存，match_line 本身不做任何
+        # 候选池级缓存（history_version 只用于失效信号，并未作为缓存键），
+        # 因此候选池内容完全由本次调用的入参决定——合并池单次调用不会让
+        # 其它客户的专属行经缓存泄漏到本任务结果中。
+        shared = [item for item in all_history if item["customer_id"] is None]
+        exclusive = [
+            item
+            for item in all_history
+            if job.customer_id and item["customer_id"] == job.customer_id
+        ]
+        history = shared + exclusive
         # 冷启动预热：把历史库元数据一次性算进 LRU 缓存，后续所有行
         # 的候选池排序/打分全部缓存命中（1675 行 × 全库 ≈ 500 万次
         # 重复解析 → 预热后全部 O(1) 命中）。
@@ -442,6 +471,10 @@ def process_job(job_id: str) -> None:
         for index, raw_line in enumerate(parsed_lines):
             # 候选基于全历史库：精确同名/同码与通用名高分候选统一评分（候选池合并）
             candidates = match_line(raw_line, history, requirements)
+            # 客户专属价目标记：打分后统一追加一次，候选卡片/导出可追溯来源
+            for candidate in candidates:
+                if is_customer_exclusive(candidate.record) and "客户专属价目" not in candidate.reasons:
+                    candidate.reasons.append("客户专属价目")
             if preferred:
                 def preference_bonus(candidate):
                     identity = normalize_text(
@@ -542,6 +575,8 @@ def process_job(job_id: str) -> None:
                 for item in candidates
                 if item.record.get("price")
                 and not is_saitel(item.record.get("source_file"))
+                # 客户专属价目是协议价，不作为压赛特尔价格的"其它来源参照"
+                and not is_customer_exclusive(item.record)
                 and bigram_dice(line_core_name, name_core(item.record.get("name", ""))) >= MATCH_NAME_FLOOR
                 and _same_range(item)
                 and (
@@ -551,6 +586,9 @@ def process_job(job_id: str) -> None:
             ]
 
             def _price_guard(item) -> bool:
+                # 客户专属价目为受信协议价（可能远低于公共中位价），豁免价格守卫
+                if is_customer_exclusive(item.record):
+                    return True
                 if not group_median:
                     return True
                 price = float(item.record.get("price", 0))
@@ -563,7 +601,7 @@ def process_job(job_id: str) -> None:
             eligible = [
                 item
                 for item in candidates
-                if item.score >= (SAITEL_FLOOR if is_saitel(item.record.get("source_file")) else AUTOSELECT_FLOOR)
+                if item.score >= _autoselect_floor(item.record)
                 and name_allows_autoselect(line_name, item.record.get("name", ""), item.record.get("source_file"))
                 and _price_guard(item)
             ]
@@ -586,6 +624,9 @@ def process_job(job_id: str) -> None:
             # 物理学科 sheet（初中物理/高中物理）再优先于小学/其他学科——天文望远镜
             # 询价是初中物理档（280元），不能被 小学科学 的 160元 压过。
             def _legacy_sheet_priority(item) -> int:
+                # 客户专属价目行永远最高优先（比物理老编号体系的 0 档更靠前）
+                if is_customer_exclusive(item.record):
+                    return -1
                 sheet = str(item.record.get("source_sheet") or "")
                 if sheet in ("初中物理", "高中物理"):
                     return 0
@@ -608,7 +649,22 @@ def process_job(job_id: str) -> None:
                     for warning in item.warnings
                 )
             ]
-            default_pool = saitel_eligible if saitel_eligible else eligible
+            # 客户专属价目优先级最高（高于赛特尔）：同样带变体守卫，
+            # 带 规格变体/规格量程/BLOCK 警告的专属候选不默认选中。
+            exclusive_eligible = [
+                item
+                for item in eligible
+                if is_customer_exclusive(item.record)
+                and not any(
+                    str(warning).startswith(("规格变体", "规格量程", "BLOCK:"))
+                    for warning in item.warnings
+                )
+            ]
+            default_pool = (
+                exclusive_eligible
+                if exclusive_eligible
+                else (saitel_eligible if saitel_eligible else eligible)
+            )
             # 名称质量优先（同核心词候选先于变体名），老编号体系 sheet 仅在
             # 名称质量相同时做价位 tiebreak（如 压力和压强演示器 9元 优先 22元）；
             # 不能把 老编号 排在 名称质量 前——否则 木直尺(初中物理) 会压过
@@ -649,7 +705,11 @@ def process_job(job_id: str) -> None:
             for candidate in ordered_candidates:
                 record = candidate.record
                 base_price = candidate.normalized_price or float(record["price"])
-                final_price = round(base_price * (1 - discount / 100), 2)
+                # 客户专属价目为最终协议价：不再叠加 VIP 协议折扣
+                if is_customer_exclusive(record):
+                    final_price = round(base_price, 2)
+                else:
+                    final_price = round(base_price * (1 - discount / 100), 2)
                 dedup_key = (
                     normalize_text(record.get("manufacturer") or record.get("brand")),
                     final_price,
@@ -665,7 +725,7 @@ def process_job(job_id: str) -> None:
                     option_warnings.append(
                         f"价格异常：偏离同组中位数（¥{group_median:g}）超过2倍，需人工核对"
                     )
-                if discount:
+                if discount and not is_customer_exclusive(record):
                     option_warnings.append(f"已应用客户折扣 {discount:g}% ，需核对毛利")
                 if needs_margin_approval:
                     option_warnings.append(
@@ -683,11 +743,11 @@ def process_job(job_id: str) -> None:
                         warnings=option_warnings,
                         unit_status=candidate.unit_status,
                         normalized_price=candidate.normalized_price,
-                        selected=record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR),
+                        selected=record["id"] in defaults and candidate.score >= _autoselect_floor(record),
                         final_price=final_price,
                     )
                 )
-                if record["id"] in defaults and candidate.score >= (SAITEL_FLOOR if is_saitel(record.get("source_file")) else AUTOSELECT_FLOOR):
+                if record["id"] in defaults and candidate.score >= _autoselect_floor(record):
                     line_has_selected = True
             if not line_has_selected and group_prices:
                 # 估算价兜底：无默认选中时按"同 JY/名称类目+同学段"的第 10 分位价

@@ -188,6 +188,11 @@ def _apply_lightweight_migrations() -> None:
                                 connection.exec_driver_sql(
                                     f"ALTER TABLE quote_options ADD COLUMN {name} {ddl_type}"
                                 )
+                history_quotes = _sqlite_columns(connection, "history_quotes")
+                if history_quotes and "customer_id" not in history_quotes:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE history_quotes ADD COLUMN customer_id INTEGER"
+                    )
             connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
             connection.commit()
         return
@@ -196,6 +201,7 @@ def _apply_lightweight_migrations() -> None:
         connection.exec_driver_sql("ALTER TABLE quote_jobs ADD COLUMN IF NOT EXISTS tax_rate FLOAT DEFAULT 0.1")
         connection.exec_driver_sql("ALTER TABLE quote_jobs ALTER COLUMN customer_id DROP NOT NULL")
         connection.exec_driver_sql("ALTER TABLE quote_options ALTER COLUMN history_quote_id DROP NOT NULL")
+        connection.exec_driver_sql("ALTER TABLE history_quotes ADD COLUMN IF NOT EXISTS customer_id INTEGER")
         for name, ddl_type in MANUAL_OPTION_COLUMNS.items():
             connection.exec_driver_sql(
                 f"ALTER TABLE quote_options ADD COLUMN IF NOT EXISTS {name} {ddl_type}"

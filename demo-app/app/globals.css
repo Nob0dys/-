@@ -306,6 +306,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .requirement-drafts b { color: var(--red); }
 .requirement-drafts button { border: 0; color: var(--muted); background: transparent; cursor: pointer; }
 
+/* --- customer exclusive price sheet --- */
+.price-sheet-block { grid-column: 1 / -1; display: grid; justify-items: start; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.price-sheet-block > strong { font-size: 10px; }
+.price-sheet-block > small { color: var(--muted); font-size: 9px; }
+.price-sheet-block .import-file { width: min(420px, 100%); flex: none; }
+.price-sheet-current { display: flex; align-items: center; gap: 10px; font-size: 10px; }
+.price-sheet-badge { margin-left: 6px; padding: 1px 5px; border-radius: 99px; color: #8d570d; background: var(--amber-soft); font-size: 8px; font-weight: 800; font-style: normal; white-space: nowrap; }
+
 .large-search { display: flex; align-items: center; gap: 10px; padding: 7px 8px 7px 14px; border: 1px solid #b6cdc4; border-radius: 11px; background: white; box-shadow: 0 8px 25px rgb(30 70 56 / .055); }
 .large-search > span { color: var(--teal); font-size: 24px; }
 .large-search input { width: 100%; padding: 8px 0; border: 0; outline: 0; font-size: 13px; }

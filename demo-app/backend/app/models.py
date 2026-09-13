@@ -90,6 +90,8 @@ class HistoryQuote(Base):
     quote_date: Mapped[str] = mapped_column(String(40), default="")
     source_priority: Mapped[int] = mapped_column(Integer, default=0)
     data_quality: Mapped[float] = mapped_column(Float, default=0)
+    # NULL = 公共历史库；非空 = 该客户的专属报价单行（仅对所属客户的任务可见）
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

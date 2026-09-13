@@ -28,6 +28,7 @@ type Customer = {
   notes: string;
   created_at: string;
   requirements: Requirement[];
+  price_sheet_count: number;
 };
 type Job = {
   id: string;
@@ -540,7 +541,7 @@ function NewQuote({ customers, onCreated }: { customers: Customer[]; onCreated: 
           <div className="row-search customer-picker-search"><span>⌕</span><input value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="按客户名称过滤" /></div>
           <div className="customer-picker-list">
             <button type="button" className={customerId === null ? "active" : ""} onClick={() => setCustomerId(null)}><strong>不关联客户（一次性报价）</strong><span>不套用任何客户折扣与特殊要求</span></button>
-            {groupCustomers.map((customer) => <button type="button" key={customer.id} className={customerId === customer.id ? "active" : ""} onClick={() => setCustomerId(customer.id)}><strong>{customer.name}</strong><span>{customer.notes || "暂无说明"}</span></button>)}
+            {groupCustomers.map((customer) => <button type="button" key={customer.id} className={customerId === customer.id ? "active" : ""} onClick={() => setCustomerId(customer.id)}><strong>{customer.name}{customer.price_sheet_count > 0 && <em className="price-sheet-badge">专属价目</em>}</strong><span>{customer.notes || "暂无说明"}</span></button>)}
             {groupCustomers.length === 0 && <small className="picker-empty">该分组下没有匹配的客户</small>}
           </div>
           {selectedCustomer && <CustomerPolicy customer={selectedCustomer} />}
@@ -571,6 +572,7 @@ function CustomerPolicy({ customer }: { customer: Customer }) {
       <div><span>{CUSTOMER_COPY[customer.customer_type]}</span><strong>{customer.name}</strong></div>
       <p>{customer.notes || "暂无客户策略说明"}</p>
       {customer.discount_percent > 0 && <small>协议折扣 {customer.discount_percent}% · 需核对最低毛利</small>}
+      {customer.price_sheet_count > 0 && <small>已关联专属报价单（{customer.price_sheet_count} 条），匹配时优先使用该价目，价格不再叠加协议折扣</small>}
       {customer.requirements.length > 0 && <ul>{customer.requirements.map((item) => <li key={item.id}><b>{item.required ? "必选" : "偏好"}</b>{item.attribute_name} {item.operator} {item.value}{item.unit}</li>)}</ul>}
     </div>
   );
@@ -802,13 +804,19 @@ function CandidateDrawer({ lineId, maxOptions, onClose, onChanged }: { lineId: n
   const [manualPrice, setManualPrice] = useState("");
   const [manualError, setManualError] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
+  const [loadError, setLoadError] = useState("");
 
   const load = useCallback(async () => {
-    const data = await api<QuoteLine>(`/api/quote-lines/${lineId}`);
-    setLine(data);
-    const options = data.options ?? [];
-    setSelected(options.filter((item) => item.selected).map((item) => item.id));
-    setPrices(Object.fromEntries(options.map((item) => [String(item.id), item.final_price])));
+    try {
+      const data = await api<QuoteLine>(`/api/quote-lines/${lineId}`);
+      setLine(data);
+      const options = data.options ?? [];
+      setSelected(options.filter((item) => item.selected).map((item) => item.id));
+      setPrices(Object.fromEntries(options.map((item) => [String(item.id), item.final_price])));
+      setLoadError("");
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : "候选方案加载失败");
+    }
   }, [lineId]);
   // Fetching the server-owned candidate state is the synchronization purpose of this effect.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -939,6 +947,7 @@ function CandidateDrawer({ lineId, maxOptions, onClose, onChanged }: { lineId: n
       <button className="drawer-dismiss" aria-label="关闭候选对比" onClick={onClose} />
       <aside className="candidate-drawer" role="dialog" aria-modal="true" aria-label="报价候选对比">
         <header><div><p className="eyebrow">CANDIDATE COMPARISON</p><h2>{line?.name ?? "正在加载…"}</h2><span>最多选择 {maxOptions} 个不同制造商方案</span></div><button onClick={onClose} aria-label="关闭">×</button></header>
+        {loadError && <div className="drawer-alert danger"><strong>加载失败</strong><span>{loadError}</span><button className="secondary-button" onClick={() => void load()}>重试</button></div>}
         {line && <div className="target-brief"><div><span>待报价参数</span><p>{line.spec || "无参数描述"}</p></div><div><span>目标型号 / 单位</span><strong>{line.model || "—"} / {line.unit || "无单位"}</strong></div><div><span>候选历史价区间{medianPrice != null ? ` · 中位 ¥${money(medianPrice)}` : ""}</span><strong>{priceRange}</strong><small className="price-chips">{sourceGroups.map((group) => <em key={group.name} title={`${group.name}：${group.count} 条候选`}>{group.name}×{group.count} ¥{money(group.min)}-{money(group.max)}</em>)}</small></div></div>}
         {line && line.warnings.length > 0 && <div className={`drawer-alert ${blockingWarnings(line.warnings).length ? "danger" : "warning"}`}><strong>{blockingWarnings(line.warnings).length ? "存在阻断风险" : "请人工核对"}</strong><span>{line.warnings.join("；").replaceAll("BLOCK: ", "")}</span></div>}
         <div className="candidate-list">
@@ -1084,6 +1093,7 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
   const [discount, setDiscount] = useState(initial?.discount_percent ?? 0);
   const [minimumMargin, setMinimumMargin] = useState(initial?.minimum_margin_percent ?? 0);
   const [preferredManufacturers, setPreferredManufacturers] = useState(initial?.preferred_manufacturers.join(", ") ?? "");
+  const [priceSheetFile, setPriceSheetFile] = useState<File | null>(null);
   const [error, setError] = useState("");
 
   function currentRequirement(): Omit<Requirement, "id"> | null {
@@ -1102,6 +1112,17 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
     setValue("");
     setUnit("");
     setError("");
+  }
+
+  async function removePriceSheet() {
+    if (!initial) return;
+    if (!window.confirm("确定删除该客户的专属报价单？")) return;
+    try {
+      await api<{ ok: boolean; deleted: number }>(`/api/customers/${initial.id}/price-sheet`, { method: "DELETE" });
+      await onSaved("专属报价单已删除。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "删除失败");
+    }
   }
 
   async function submit(event: FormEvent) {
@@ -1124,18 +1145,37 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
           ? preferredManufacturers.split(/[,，]/).map((item) => item.trim()).filter(Boolean)
           : [],
       };
+      let customerId: number;
       if (editing) {
         await api<Customer>(`/api/customers/${initial.id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+        customerId = initial.id;
       } else {
-        await api<Customer>("/api/customers", {
+        const created = await api<Customer>("/api/customers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+        customerId = created.id;
+      }
+      if (priceSheetFile) {
+        try {
+          const formData = new FormData();
+          formData.set("file", priceSheetFile);
+          const result = await api<{ inserted: number; skipped_duplicates: number; skipped_invalid: number }>(`/api/customers/${customerId}/price-sheet`, { method: "POST", body: formData });
+          await onSaved(editing
+            ? `客户档案已更新，专属报价单已整表替换（导入 ${result.inserted} 条 / 重复跳过 ${result.skipped_duplicates} 条 / 无效 ${result.skipped_invalid} 条）。`
+            : `客户档案已创建，专属报价单已上传（导入 ${result.inserted} 条 / 重复跳过 ${result.skipped_duplicates} 条 / 无效 ${result.skipped_invalid} 条）。`);
+        } catch (reason) {
+          const message = reason instanceof Error ? reason.message : "上传失败";
+          await onSaved(editing
+            ? `客户档案已更新，但专属报价单上传失败，可重新上传：${message}`
+            : `客户档案已创建，但专属报价单上传失败，可在编辑中重新上传：${message}`);
+        }
+        return;
       }
       await onSaved(editing ? "客户档案已更新。" : "客户档案已创建。");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); }
@@ -1168,6 +1208,21 @@ function CustomerForm({ initial, defaultType, onSaved }: { initial: Customer | n
         <label className="wide-field"><span>偏好制造商</span><input value={preferredManufacturers} onChange={(event) => setPreferredManufacturers(event.target.value)} placeholder="多个制造商用逗号分隔" /></label>
       </>}
 
+      <div className="price-sheet-block">
+        <strong>专属报价单（可选）</strong>
+        {editing && initial.price_sheet_count > 0 && (
+          <span className="price-sheet-current">
+            当前专属报价单：{initial.price_sheet_count} 条
+            <button type="button" className="card-action-button danger" onClick={() => void removePriceSheet()}>删除</button>
+          </span>
+        )}
+        <label className="import-file">
+          <input type="file" accept=".xlsx,.xls,.xlsm" onChange={(event) => setPriceSheetFile(event.target.files?.[0] ?? null)} />
+          <span>{priceSheetFile ? priceSheetFile.name : editing && initial.price_sheet_count > 0 ? `重新上传（整表替换现有 ${initial.price_sheet_count} 条）` : "选择专属报价单 Excel"}</span>
+        </label>
+        <small>上传后，该客户的报价任务将优先使用此价目（价格不叠加协议折扣）</small>
+      </div>
+
       <button className="primary-button">{editing ? "保存修改" : "保存客户"}</button>
       {error && <div className="form-error">{error}</div>}
     </form>
@@ -1178,12 +1233,21 @@ function HistorySearch({ user, notify }: { user: User; notify: (message: string)
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<HistoryResult[]>([]);
   const [loading, setLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [showEntry, setShowEntry] = useState(false);
 
   async function runSearch(keyword: string) {
     if (!keyword.trim()) return;
     setLoading(true);
-    try { setResults(await api<HistoryResult[]>(`/api/history/search?q=${encodeURIComponent(keyword.trim())}`)); } finally { setLoading(false); }
+    setSearchError("");
+    try {
+      setResults(await api<HistoryResult[]>(`/api/history/search?q=${encodeURIComponent(keyword.trim())}`));
+    } catch (reason) {
+      setResults([]);
+      setSearchError(reason instanceof Error ? reason.message : "查询失败");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function submit(event: FormEvent) {
@@ -1194,7 +1258,8 @@ function HistorySearch({ user, notify }: { user: User; notify: (message: string)
     <section>
       <PageHeading eyebrow="HISTORICAL PRICES" title="历史报价查询" detail="从服务器数据库查询产品、参数、型号、品牌和制造商。" action={user.role === "admin" ? <button className="primary-button" onClick={() => setShowEntry(true)}>＋ 手工录入</button> : undefined} />
       <form className="large-search" onSubmit={submit}><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入产品名称、参数、型号、品牌或制造商" /><button className="primary-button">{loading ? "查询中…" : "查询"}</button></form>
-      <div className="history-results">{results.map((item) => <article key={item.id}><div><h3>{item.name}</h3><strong>¥ {money(item.price)}</strong></div><span>{item.model || "无型号"} · {item.brand || "无品牌"} · {item.manufacturer || "无制造商"} · {item.unit || "无单位"}</span><p>{item.spec || "无参数描述"}</p><footer>{item.quote_date || "日期未记录"}<b>{item.source}</b></footer></article>)}{query && !loading && !results.length && <div className="empty-state compact"><strong>没有找到相关历史报价</strong><span>可缩短关键词或改用产品名称。</span></div>}</div>
+      {searchError && <div className="form-error">{searchError}</div>}
+      <div className="history-results">{results.map((item) => <article key={item.id}><div><h3>{item.name}</h3><strong>¥ {money(item.price)}</strong></div><span>{item.model || "无型号"} · {item.brand || "无品牌"} · {item.manufacturer || "无制造商"} · {item.unit || "无单位"}</span><p>{item.spec || "无参数描述"}</p><footer>{item.quote_date || "日期未记录"}<b>{item.source}</b></footer></article>)}{query && !loading && !searchError && !results.length && <div className="empty-state compact"><strong>没有找到相关历史报价</strong><span>可缩短关键词或改用产品名称。</span></div>}</div>
       {showEntry && <HistoryEntryModal onClose={() => setShowEntry(false)} onSaved={async () => { setShowEntry(false); notify("历史报价已录入。"); await runSearch(query); }} />}
     </section>
   );
@@ -1355,7 +1420,12 @@ function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
-    setData(await api<DatabaseList>("/api/databases"));
+    try {
+      setData(await api<DatabaseList>("/api/databases"));
+      setError("");
+    } catch {
+      setError("无法连接服务器，请确认后端已启动后点重试");
+    }
   }, []);
   // Fetching the server-owned database list is the synchronization purpose of this effect.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -1431,6 +1501,12 @@ function DatabaseManager({ onChanged, notify }: { onChanged: () => Promise<void>
         </form>
       </div>
       <div className="governance-grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))" }}>
+        {data === null && error && (
+          <article className="db-card" style={{ padding: 16, border: "1px solid var(--line)", borderRadius: 12, background: "white" }}>
+            <p style={{ margin: 0, color: "var(--muted)", fontSize: 10 }}>数据库列表加载失败</p>
+            <button className="secondary-button" style={{ marginTop: 10 }} onClick={() => void load()}>重试</button>
+          </article>
+        )}
         {(data?.databases ?? []).map((db) => {
           const active = db.name === data?.current;
           return (
@@ -1465,7 +1541,12 @@ function AccountAdmin({ notify }: { notify: (message: string) => void }) {
   const [resetTarget, setResetTarget] = useState<AccountUser | null>(null);
 
   const loadAccounts = useCallback(async () => {
-    setAccounts(await api<AccountUser[]>("/api/users"));
+    try {
+      setAccounts(await api<AccountUser[]>("/api/users"));
+      setError("");
+    } catch {
+      setError("无法连接服务器，请确认后端已启动后点重试");
+    }
   }, []);
   // Fetching the server-owned account list is the synchronization purpose of this effect.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -1517,6 +1598,11 @@ function AccountAdmin({ notify }: { notify: (message: string) => void }) {
         {error && <div className="form-error">{error}</div>}
       </form>
       <div className="review-card">
+        {accounts.length === 0 && error && (
+          <div style={{ padding: "13px 14px", borderBottom: "1px solid var(--line)" }}>
+            <button className="secondary-button" onClick={() => void loadAccounts()}>重试</button>
+          </div>
+        )}
         <div className="table-scroll account-table">
           <table className="quote-table">
             <thead><tr><th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>

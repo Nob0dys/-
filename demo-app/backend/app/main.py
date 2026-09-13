@@ -190,7 +190,7 @@ def managed_user_payload(user: User) -> dict:
     }
 
 
-def customer_payload(customer: Customer) -> dict:
+def customer_payload(customer: Customer, price_sheet_count: int = 0) -> dict:
     return {
         "id": customer.id,
         "name": customer.name,
@@ -199,6 +199,7 @@ def customer_payload(customer: Customer) -> dict:
         "minimum_margin_percent": customer.minimum_margin_percent,
         "preferred_manufacturers": customer.preferred_manufacturers or [],
         "notes": customer.notes,
+        "price_sheet_count": price_sheet_count,
         "created_at": customer.created_at.isoformat(),
         "requirements": [
             {
@@ -517,6 +518,16 @@ def update_user(
     return managed_user_payload(target)
 
 
+def _price_sheet_counts(db: Session) -> dict[int, int]:
+    """一次 group-by 汇总各客户专属价目行数，避免列表接口 N+1 查询。"""
+    rows = db.execute(
+        select(HistoryQuote.customer_id, func.count())
+        .where(HistoryQuote.customer_id.is_not(None))
+        .group_by(HistoryQuote.customer_id)
+    ).all()
+    return {customer_id: int(count) for customer_id, count in rows}
+
+
 @app.get("/api/customers")
 def list_customers(
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
@@ -524,7 +535,8 @@ def list_customers(
     customers = db.scalars(
         select(Customer).options(selectinload(Customer.requirements)).where(Customer.active.is_(True)).order_by(Customer.created_at.desc())
     ).all()
-    return [customer_payload(item) for item in customers]
+    counts = _price_sheet_counts(db)
+    return [customer_payload(item, price_sheet_count=counts.get(item.id, 0)) for item in customers]
 
 
 @app.post("/api/customers")
@@ -551,7 +563,7 @@ def create_customer(
     db.commit()
     db.refresh(customer)
     customer = db.scalar(select(Customer).options(selectinload(Customer.requirements)).where(Customer.id == customer.id))
-    return customer_payload(customer)
+    return customer_payload(customer, price_sheet_count=_price_sheet_counts(db).get(customer.id, 0))
 
 
 @app.patch("/api/customers/{customer_id}")
@@ -598,7 +610,158 @@ def update_customer(
     customer = db.scalar(
         select(Customer).options(selectinload(Customer.requirements)).where(Customer.id == customer_id)
     )
-    return customer_payload(customer)
+    return customer_payload(customer, price_sheet_count=_price_sheet_counts(db).get(customer_id, 0))
+
+
+@app.post("/api/customers/{customer_id}/price-sheet")
+def upload_customer_price_sheet(
+    customer_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """上传（整表替换）客户专属报价单：每客户至多一份，重新上传即覆盖旧行。"""
+    customer = db.get(Customer, customer_id)
+    if not customer or not customer.active:
+        raise HTTPException(status_code=404, detail="客户不存在")
+    original_name = Path(file.filename or "price-sheet.xlsx").name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in (".xlsx", ".xlsm", ".xls"):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx / .xlsm / .xls 文件")
+    temp_dir = DATA_DIR / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"price-sheet-{uuid.uuid4()}{suffix or '.xlsx'}"
+    try:
+        temp_path.write_bytes(file.file.read())
+        rows = parse_history_workbook(str(temp_path), original_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=400, detail="无法解析该文件，请确认是有效的 Excel 文件")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    # 整表替换：先清空该客户全部旧专属行，再写入新行
+    db.execute(delete(HistoryQuote).where(HistoryQuote.customer_id == customer_id))
+    source_file = f"客户专属价目-{customer.name}"
+    inserted = skipped_duplicates = skipped_invalid = 0
+    seen_keys: set[tuple] = set()
+    used_ids: set[str] = set()
+    for row in rows:
+        price = row["price"]
+        if not price or price <= 0:
+            skipped_invalid += 1
+            continue
+        # 只在该客户自己的专属行集合内去重，不与公共库互相去重
+        key = history_dedup_key(row["name"], row["spec"], row["unit"], row["manufacturer"], price)
+        if key in seen_keys:
+            skipped_duplicates += 1
+            continue
+        seen_keys.add(key)
+        record_id = f"customer-{customer_id}:{row['sheet_name']}:{row['source_row']}"
+        if record_id in used_ids:
+            sequence = 2
+            while f"{record_id}#{sequence}" in used_ids:
+                sequence += 1
+            record_id = f"{record_id}#{sequence}"
+        used_ids.add(record_id)
+        quality_fields = [row["spec"], row["model"], row["manufacturer"], row["unit"], "", source_file]
+        db.add(
+            HistoryQuote(
+                id=record_id,
+                source_file=source_file,
+                source_sheet=row["sheet_name"],
+                source_row=row["source_row"],
+                name=row["name"],
+                normalized_name=normalize_text(row["name"]),
+                spec=row["spec"],
+                normalized_spec=normalize_text(row["spec"]),
+                product_code="",
+                normalized_product_code="",
+                model=row["model"],
+                normalized_model=normalize_text(row["model"]),
+                brand=row["brand"],
+                manufacturer=row["manufacturer"],
+                unit=row["unit"],
+                normalized_unit=normalize_text(row["unit"]),
+                price=price,
+                quote_date="",
+                source_priority=0,
+                data_quality=sum(bool(item) for item in quality_fields) / len(quality_fields),
+                customer_id=customer_id,
+            )
+        )
+        inserted += 1
+    audit(
+        db,
+        user.id,
+        "customer.price_sheet.upload",
+        "customer",
+        customer_id,
+        {
+            "file": original_name,
+            "inserted": inserted,
+            "skipped_duplicates": skipped_duplicates,
+            "skipped_invalid": skipped_invalid,
+        },
+    )
+    bump_history_version(db)
+    db.commit()
+    return {
+        "inserted": inserted,
+        "skipped_duplicates": skipped_duplicates,
+        "skipped_invalid": skipped_invalid,
+    }
+
+
+@app.get("/api/customers/{customer_id}/price-sheet")
+def get_customer_price_sheet(
+    customer_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    customer = db.get(Customer, customer_id)
+    if not customer or not customer.active:
+        raise HTTPException(status_code=404, detail="客户不存在")
+    rows = db.scalars(
+        select(HistoryQuote)
+        .where(HistoryQuote.customer_id == customer_id)
+        .order_by(HistoryQuote.source_sheet, HistoryQuote.source_row)
+    ).all()
+    return {
+        "count": len(rows),
+        "rows": [
+            {
+                "name": item.name,
+                "spec": item.spec,
+                "model": item.model,
+                "brand": item.brand,
+                "manufacturer": item.manufacturer,
+                "unit": item.unit,
+                "price": item.price,
+            }
+            for item in rows[:20]
+        ],
+    }
+
+
+@app.delete("/api/customers/{customer_id}/price-sheet")
+def delete_customer_price_sheet(
+    customer_id: int,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    customer = db.get(Customer, customer_id)
+    if not customer or not customer.active:
+        raise HTTPException(status_code=404, detail="客户不存在")
+    deleted = int(
+        db.scalar(select(func.count(HistoryQuote.id)).where(HistoryQuote.customer_id == customer_id)) or 0
+    )
+    db.execute(delete(HistoryQuote).where(HistoryQuote.customer_id == customer_id))
+    audit(db, user.id, "customer.price_sheet.delete", "customer", customer_id, {"deleted": deleted})
+    bump_history_version(db)
+    db.commit()
+    return {"ok": True, "deleted": deleted}
 
 
 @app.delete("/api/customers/{customer_id}")
@@ -1365,12 +1528,14 @@ def review_price_draft(
         draft.status = "rejected"
         db.commit()
         return {"ok": True, "status": "rejected"}
-    # 批准：写入历史库（去重靠 history_dedup_key，重复则跳过）
+    # 批准：写入公共历史库（去重靠 history_dedup_key，重复则跳过）。
+    # 只与公共库（customer_id 为空）比对：客户专属价目行不参与，
+    # 避免草稿价与某客户专属价相同时被误判为重复而丢弃。
     draft.status = "approved"
     dedup_key = history_dedup_key(
         draft.name, draft.spec, draft.unit, draft.manufacturer, draft.confirmed_price
     )
-    existing = db.scalars(select(HistoryQuote)).all()
+    existing = db.scalars(select(HistoryQuote).where(HistoryQuote.customer_id.is_(None))).all()
     seen_keys = {
         history_dedup_key(item.name, item.spec, item.unit, item.manufacturer, item.price)
         for item in existing
@@ -1440,7 +1605,13 @@ def governance_summary(
 def dedup_history(
     user: User = Depends(require_admin), db: Session = Depends(get_db)
 ):
-    records = db.scalars(select(HistoryQuote).order_by(HistoryQuote.created_at, HistoryQuote.id)).all()
+    # 只对公共历史库（customer_id 为空）去重：客户专属价目行不参与，
+    # 既不作为被删的重复项，也不作为公共行的合并目标，避免专属行被误删误并。
+    records = db.scalars(
+        select(HistoryQuote)
+        .where(HistoryQuote.customer_id.is_(None))
+        .order_by(HistoryQuote.created_at, HistoryQuote.id)
+    ).all()
     keep_by_key: dict[tuple, HistoryQuote] = {}
     removed = 0
     for record in records:
@@ -1487,7 +1658,8 @@ def import_history(
 
     seen_keys = {
         history_dedup_key(item.name, item.spec, item.unit, item.manufacturer, item.price)
-        for item in db.scalars(select(HistoryQuote)).all()
+        # 只与公共历史库去重：客户专属价目行不参与，避免专属价阻塞公共导入
+        for item in db.scalars(select(HistoryQuote).where(HistoryQuote.customer_id.is_(None))).all()
     }
     inserted = skipped_duplicates = skipped_invalid = 0
     for row in rows:
