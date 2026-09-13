@@ -1,0 +1,7 @@
+.DS_Store
+
+# 后端运行时数据（SQLite 数据库 146MB，超过 GitHub 100MB 限制；上传/导出为运行产物）
+demo-app/backend/data/
+
+# Cloudflare Wrangler 本地构建缓存
+demo-app/.wrangler/

@@ -1,0 +1,119 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quotation}
+      POSTGRES_USER: ${POSTGRES_USER:-quotation}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - quote_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quotation} -d ${POSTGRES_DB:-quotation}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment: &api_environment
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-quotation}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-quotation}
+      QUOTE_DATA_DIR: /data
+      HISTORY_SEED_PATH: /app/seed/history.json
+      QUOTE_RUN_INLINE_JOBS: "false"
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?请在 .env 中设置 DEFAULT_ADMIN_PASSWORD}
+      DEFAULT_QUOTE_USERNAME: ${DEFAULT_QUOTE_USERNAME:-quote}
+      DEFAULT_QUOTE_PASSWORD: ${DEFAULT_QUOTE_PASSWORD:?请在 .env 中设置 DEFAULT_QUOTE_PASSWORD}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-80}
+    volumes:
+      - quote_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment: *api_environment
+    volumes:
+      - quote_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-quotation}
+      PGUSER: ${POSTGRES_USER:-quotation}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - quote_files:/quote-files:ro
+      - quote_backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        while true; do
+          stamp="$$(date +%Y%m%d-%H%M%S)"
+          db_tmp="/backups/database-$${stamp}.dump.tmp"
+          files_tmp="/backups/files-$${stamp}.tar.gz.tmp"
+          if pg_dump -Fc -f "$${db_tmp}" && tar -czf "$${files_tmp}" -C /quote-files .; then
+            mv "$${db_tmp}" "/backups/database-$${stamp}.dump"
+            mv "$${files_tmp}" "/backups/files-$${stamp}.tar.gz"
+          else
+            rm -f "$${db_tmp}" "$${files_tmp}"
+          fi
+          find /backups -maxdepth 1 -type f \( -name 'database-*.dump' -o -name 'files-*.tar.gz' \) -mtime "+$${BACKUP_RETENTION_DAYS}" -delete
+          sleep "$${BACKUP_INTERVAL_SECONDS}"
+        done
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${QUOTE_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      web:
+        condition: service_started
+      api:
+        condition: service_healthy
+
+volumes:
+  quote_postgres:
+  quote_files:
+  quote_backups:

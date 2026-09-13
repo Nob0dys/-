@@ -1,0 +1,11 @@
+.git
+.next
+.wrangler
+dist
+node_modules
+backend/.venv
+backend/.pytest_cache
+backend/**/__pycache__
+backend/data
+*.log
+.DS_Store
