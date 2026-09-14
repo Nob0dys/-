@@ -166,14 +166,17 @@ def parameter_similarity(left: str, right: str) -> float:
             has_ranges = True
             overlap = max(0, min(lr[1], rr[1]) - max(lr[0], rr[0]))
             total = max(lr[1], rr[1]) - min(lr[0], rr[0])
-            if total > 0:
-                iou = overlap / total
-                if iou > 0.8:
-                    range_bonus = max(range_bonus, 0.3)
-                elif iou > 0.5:
-                    range_bonus = max(range_bonus, 0.15)
-                elif iou < 0.2:
-                    range_bonus = min(range_bonus, -0.2)
+            if total == 0:
+                # 退化区间 (v,v) 对 (v,v)：单值相等视为完全一致
+                range_bonus = max(range_bonus, 0.3)
+                continue
+            iou = overlap / total
+            if iou > 0.8:
+                range_bonus = max(range_bonus, 0.3)
+            elif iou > 0.5:
+                range_bonus = max(range_bonus, 0.15)
+            elif iou < 0.2:
+                range_bonus = min(range_bonus, -0.2)
 
     # 短 spec 是弱信号：4-6 字的"永磁、电磁场"类描述不应与长文本高相似，
     # 避免让"部分同名但规格巧合重叠"的候选压过真正同名的候选。
@@ -424,10 +427,11 @@ CAP_PATTERN = re.compile(
 )
 
 # P0: 规格范围提取模式
-# 匹配 "Φ7～8mm" "φ7mm～8mm" "7-8mm" "7~8mm" "7—8mm" "7－8mm" 等范围格式
+# 匹配 "Φ7～8mm" "φ7mm～8mm" "7-8mm" "7~8mm" "7—8mm" "7－8mm" 等范围格式；
+# 第二个数字允许带 φ/Φ 前缀（"Φ3mm~Φ4mm" 应解析为 (3,4) 而非单值 (3,3)+(4,4)）
 RANGE_PATTERN = re.compile(
     r"[Φφ]?\s*(\d+(?:\.\d+)?)\s*(?:mm|cm|m|ml|l|g|kg|mg|℃|°c|v|a|w|hz|pa|kpa|mpa|%)?\s*"
-    r"[～~—－-]\s*(\d+(?:\.\d+)?)\s*"
+    r"[～~—－-]\s*[Φφ]?\s*(\d+(?:\.\d+)?)\s*"
     r"(mm|cm|m|ml|l|g|kg|mg|℃|°c|v|a|w|hz|pa|kpa|mpa|%)?",
     re.IGNORECASE,
 )
@@ -557,7 +561,9 @@ def _spec_features(text: object) -> dict:
         # 教学用=大规格高价档。询价与候选定位冲突时罚分。
         # 注意："教学用磁钢极性标注"是标准表述（含"教学用"但非定位词），
         # 用 学生用/教师用/演示用 等明确定位词判断，避免误触发。
-        "student": bool(re.search(r"学生用|学生型", nt)),
+        # "分组用"（学生分组实验用）归入学生定位：分子结构模型 分组用40元
+        # 应与 演示用140元 区分。
+        "student": bool(re.search(r"学生用|学生型|分组用", nt)),
         "teaching": bool(re.search(r"教师用|演示用|教学用(?!磁钢)", nt)),
         # P1: 形状关键词
         "shape": "",
@@ -565,6 +571,9 @@ def _spec_features(text: object) -> dict:
         "material": "",
         # P1: 放大倍数
         "magnification": "",
+        # P1: 套件件数（"7件"/"4件套"）：解剖器 7件 vs 4件 等套件规格的区分维度。
+        # 只支持阿拉伯数字——"二件支杆滑轮" 等中文数词不提取，避免误判。
+        "pcs": None,
     }
 
     # P1: 形状提取
@@ -609,6 +618,11 @@ def _spec_features(text: object) -> dict:
         else:
             features["magnification"] = f"{mag_match.group(1)}×"
 
+    # P1: 套件件数提取（"7件"/"4件套"）
+    pcs_match = re.search(r"(\d+(?:\.\d+)?)\s*件\s*套?", nt)
+    if pcs_match:
+        features["pcs"] = float(pcs_match.group(1))
+
     for amount_text, unit_text in CAP_PATTERN.findall(nt):
         value = float(amount_text)
         unit = normalize_text(unit_text)
@@ -652,7 +666,10 @@ def numeric_spec_bonus(line: dict, record: dict) -> float:
         if lr and rr:
             overlap = max(0, min(lr[1], rr[1]) - max(lr[0], rr[0]))
             total = max(lr[1], rr[1]) - min(lr[0], rr[0])
-            if total > 0:
+            if total == 0:
+                # 退化区间 (v,v) 对 (v,v)：单值相等视为完全一致
+                bonus += 2.0
+            else:
                 iou = overlap / total
                 if iou > 0.8:
                     bonus += 2.0
@@ -663,6 +680,9 @@ def numeric_spec_bonus(line: dict, record: dict) -> float:
         record_value = record_feat["caps"].get(unit)
         if line_value and record_value and abs(record_value - line_value) / line_value <= 0.02:
             bonus += 2.0
+    # 套件件数一致加分（解剖器 7件 vs 7件）
+    if line_feat["pcs"] and record_feat["pcs"] and line_feat["pcs"] == record_feat["pcs"]:
+        bonus += 2.0
     return min(bonus, 6.0)
 
 
@@ -726,7 +746,11 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
             # 范围重叠度检查：如果两个范围有显著重叠（>80%），视为相同
             overlap = max(0, min(line_range[1], record_range[1]) - max(line_range[0], record_range[0]))
             total = max(line_range[1], record_range[1]) - min(line_range[0], record_range[0])
-            if total > 0 and overlap / total > 0.8:
+            if total == 0:
+                # 退化区间 (v,v) 对 (v,v)：单值相等不罚
+                # （修复 "询价500~500ml vs 候选500~500ml" 的假量程警告）
+                continue
+            if overlap / total > 0.8:
                 continue  # 范围重叠，不罚分
             # 范围不重叠，罚分
             penalty += 8
@@ -800,6 +824,13 @@ def variant_penalty(line: dict, record: dict) -> tuple[float, list[str]]:
     if line_feat["magnification"] and record_feat["magnification"] and line_feat["magnification"] != record_feat["magnification"]:
         penalty += 8
         warnings.append(f"规格倍数不符：询价{line_feat['magnification']}，候选{record_feat['magnification']}")
+
+    # P1: 套件件数不符罚分（解剖器 7件 vs 4件）——双方都提取到件数且不等才罚
+    if line_feat["pcs"] and record_feat["pcs"] and line_feat["pcs"] != record_feat["pcs"]:
+        penalty += 8
+        warnings.append(
+            f"规格件数不符：询价{line_feat['pcs']:g}件，候选{record_feat['pcs']:g}件"
+        )
 
     # 修饰词变体罚：把修饰词从两个名字都剥掉后核心相同、但修饰词集合不同，
     # 视为不同产品（演示斜面小车≠斜面小车、数显电流表≠指针电流表）。
@@ -915,8 +946,11 @@ def score_record(line: dict, record: dict, requirements: list[dict] | None = Non
         # 精确同名产品压到选不中（如 摩擦力演示器 同名候选只有30分被判unmatched）。
         # 但候选自身无 spec 时不保底——无规格信息的记录无法证明量程吻合，
         # 保底会让 直尺5.0(无spec) 压过 直尺6.0(演示用1m塑料米尺)。
+        # exact_code 候选不保底：其得分固定 100 基础分、不依赖分项，
+        # 保底只会抹平同码不同规格在排序键上的参数差异（分子结构模型
+        # 演示用/分组用/初中用 参数分量全被压成 16）。
         "参数": round(
-            (spec_similarity if not (name_exact and record.get("spec")) else max(spec_similarity, 0.4)) * 40,
+            (spec_similarity if exact_code or not (name_exact and record.get("spec")) else max(spec_similarity, 0.4)) * 40,
             2,
         ),
         "型号": round(model_similarity * 13, 2),
@@ -966,12 +1000,13 @@ def score_record(line: dict, record: dict, requirements: list[dict] | None = Non
         warnings.append(f"BLOCK: {category_reason}")
     warnings.extend(requirement_warnings(record, requirements))
     penalty, variant_warnings = variant_penalty(line, record)
-    if not category_ok:
+    if not category_ok and not exact_code:
         penalty += 20  # 类目不符额外重罚（区别于规格变体）
     warnings.extend(variant_warnings)
     numeric_bonus = numeric_spec_bonus(line, record)
-    if not exact_code:
-        score = round(max(0.0, score - penalty) + numeric_bonus, 2)
+    # exact_code 保持 100 基础分与候选锁池，但规格变体罚分与数值加分照常执行：
+    # 同码不同规格的记录由此拉开分差（注射器 10/50/100mL 不再被压成同分同价）。
+    score = round(max(0.0, score - penalty) + numeric_bonus, 2)
     if numeric_bonus >= 4:
         reasons.append("规格数值吻合")
     confidence = confidence_for(score, warnings)

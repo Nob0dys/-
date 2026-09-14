@@ -77,6 +77,17 @@ def normalize_code_fields(record: dict) -> dict:
     return record
 
 
+def strip_code_decimal_suffix(value: object) -> str:
+    """xls 数值格把编码读成 "27001.0"：纯整数+.0 形态去小数后缀还原编码。
+
+    只处理"纯整数+.0"形态，真实含小数的编码（如 "3.5"）不受影响。
+    """
+    text = str(value or "").strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
 def extract_line_code(*texts: object) -> str:
     """Pull a standalone five-digit JY code out of a raw inquiry cell.
 
@@ -438,8 +449,10 @@ def parse_history_workbook(path: str, source_name: str = "") -> list[dict]:
                 "source_row": row_number,
                 "name": name,
                 "spec": cell_text(ws.cell(row_number, columns["spec"])) if columns.get("spec") else "",
-                "product_code": cell_text(ws.cell(row_number, columns["product_code"])) if columns.get("product_code") else "",
-                "model": cell_text(ws.cell(row_number, columns["model"])) if columns.get("model") else "",
+                # xls 数值格编码去 ".0" 后缀（"27001.0"→"27001"），
+                # 否则 normalize_text 后变 270010，exact-code 分流整体失效
+                "product_code": strip_code_decimal_suffix(cell_text(ws.cell(row_number, columns["product_code"]))) if columns.get("product_code") else "",
+                "model": strip_code_decimal_suffix(cell_text(ws.cell(row_number, columns["model"]))) if columns.get("model") else "",
                 "brand": cell_text(ws.cell(row_number, columns["brand"])) if columns.get("brand") else "",
                 "manufacturer": cell_text(ws.cell(row_number, columns["manufacturer"])) if columns.get("manufacturer") else "",
                 "unit": cell_text(ws.cell(row_number, columns["unit"])) if columns.get("unit") else "",

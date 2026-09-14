@@ -63,6 +63,12 @@ MODE_TERMS_RE = re.compile(
 # 赛特尔优先：仅“赛特尔25年.xls”价目本为最高优先级来源（有赛特尔25年记录时
 # 优先默认选中）；其余所有文件（普教/包1-4/标准答案等）优先级相同。
 SAITEL_MARK = "赛特尔25年"
+# 变体守卫：带这些警告前缀的候选不进入默认选中池（规格/定位/形状/材质等
+# 错配不自动带价；BLOCK 类硬警告同理）。
+VARIANT_GUARD_PREFIXES = (
+    "规格变体", "规格量程", "规格尺寸", "规格定位", "规格形状",
+    "规格材质", "规格倍数", "修饰词变体", "BLOCK:",
+)
 
 
 def mode_conflict(line_core: str, record_core: str) -> bool:
@@ -555,35 +561,53 @@ def process_job(job_id: str) -> None:
                         return False
                 return True
 
-            group_prices = [
-                float(item.record.get("price", 0))
-                for item in candidates
-                if item.record.get("price")
-                and bigram_dice(line_core_name, name_core(item.record.get("name", ""))) >= MATCH_NAME_FLOOR
-                and _same_range(item)
-                # 核心词包含：电子天平 组只统计 电子天平，不混入 托盘天平/钩码 等
-                # 仅 bigram 相似的产品——否则 14/30元 托盘天平 会把 385元 电子天平
-                # 拉出 2x 守卫误杀，导致真实价被排除、走估算价兜底。
-                and (
-                    name_core(item.record.get("name", "")) in line_core_name
-                    or line_core_name in name_core(item.record.get("name", ""))
-                )
-            ]
+            line_code_norm = normalize_text(raw_line.get("product_code", ""))
+
+            def _is_exact_code(item) -> bool:
+                """候选与询价产品编码精确一致：编码已锁定同一产品，
+                名称一字之差（手摇离心钻台↔转台）不再卡名称门槛。"""
+                return bool(line_code_norm) and normalize_text(item.record.get("product_code", "")) == line_code_norm
+
+            def _price_pool(require_exact_core: bool, exclude_trusted: bool = False) -> list[float]:
+                """价格守卫中位数组。require_exact_core=True 时只收核心名与询价
+                完全相等的记录（烧瓶刷 不再混入 烧瓶 的基准）；exact_code 命中的
+                记录视同同名（编码已锁定同一产品）。"""
+                pool: list[float] = []
+                for item in candidates:
+                    if not item.record.get("price") or not _same_range(item):
+                        continue
+                    if exclude_trusted and (
+                        is_saitel(item.record.get("source_file"))
+                        # 客户专属价目是协议价，不作为压赛特尔价格的"其它来源参照"
+                        or is_customer_exclusive(item.record)
+                    ):
+                        continue
+                    record_core = name_core(item.record.get("name", ""))
+                    if require_exact_core:
+                        name_ok = record_core == line_core_name
+                    else:
+                        # 核心词包含：电子天平 组只统计 电子天平，不混入 托盘天平/钩码 等
+                        # 仅 bigram 相似的产品——否则 14/30元 托盘天平 会把 385元 电子天平
+                        # 拉出 2x 守卫误杀，导致真实价被排除、走估算价兜底。
+                        name_ok = (
+                            bigram_dice(line_core_name, record_core) >= MATCH_NAME_FLOOR
+                            and (
+                                record_core in line_core_name
+                                or line_core_name in record_core
+                            )
+                        )
+                    if name_ok or _is_exact_code(item):
+                        pool.append(float(item.record.get("price", 0)))
+                return pool
+
+            # 优先用完全同名集合；不足 3 条时退回核心词包含逻辑（样本量保证）
+            group_prices = _price_pool(require_exact_core=True)
+            if len(group_prices) < 3:
+                group_prices = _price_pool(require_exact_core=False)
             group_median = robust_median(group_prices) if len(group_prices) >= 3 else 0.0
-            non_saitel_prices = [
-                float(item.record.get("price", 0))
-                for item in candidates
-                if item.record.get("price")
-                and not is_saitel(item.record.get("source_file"))
-                # 客户专属价目是协议价，不作为压赛特尔价格的"其它来源参照"
-                and not is_customer_exclusive(item.record)
-                and bigram_dice(line_core_name, name_core(item.record.get("name", ""))) >= MATCH_NAME_FLOOR
-                and _same_range(item)
-                and (
-                    name_core(item.record.get("name", "")) in line_core_name
-                    or line_core_name in name_core(item.record.get("name", ""))
-                )
-            ]
+            non_saitel_prices = _price_pool(require_exact_core=True, exclude_trusted=True)
+            if len(non_saitel_prices) < 3:
+                non_saitel_prices = _price_pool(require_exact_core=False, exclude_trusted=True)
 
             def _price_guard(item) -> bool:
                 # 客户专属价目为受信协议价（可能远低于公共中位价），豁免价格守卫
@@ -602,7 +626,12 @@ def process_job(job_id: str) -> None:
                 item
                 for item in candidates
                 if item.score >= _autoselect_floor(item.record)
-                and name_allows_autoselect(line_name, item.record.get("name", ""), item.record.get("source_file"))
+                and (
+                    # exact_code 命中跳过名称门槛（match_line 池级 code_compatible
+                    # 已防跨编码体系冲突）
+                    _is_exact_code(item)
+                    or name_allows_autoselect(line_name, item.record.get("name", ""), item.record.get("source_file"))
+                )
                 and _price_guard(item)
             ]
 
@@ -638,25 +667,25 @@ def process_job(job_id: str) -> None:
 
             # 赛特尔优先：有赛特尔候选时仅默认选中赛特尔（报价1 为赛特尔），
             # 其余来源仍作为备选展示；赛特尔内部按名称匹配质量→分数排序。
-            # 变体守卫：赛特尔候选若带 规格变体/量程不符/BLOCK 警告（如初中电源
+            # 变体守卫：赛特尔候选若带规格类/修饰词变体/BLOCK 警告（如初中电源
             # 顶替高中电源），不默认选中，避免“有赛特尔选赛特尔”引入错配。
             saitel_eligible = [
                 item
                 for item in eligible
                 if is_saitel(item.record.get("source_file"))
                 and not any(
-                    str(warning).startswith(("规格变体", "规格量程", "BLOCK:"))
+                    str(warning).startswith(VARIANT_GUARD_PREFIXES)
                     for warning in item.warnings
                 )
             ]
             # 客户专属价目优先级最高（高于赛特尔）：同样带变体守卫，
-            # 带 规格变体/规格量程/BLOCK 警告的专属候选不默认选中。
+            # 带规格类/修饰词变体/BLOCK 警告的专属候选不默认选中。
             exclusive_eligible = [
                 item
                 for item in eligible
                 if is_customer_exclusive(item.record)
                 and not any(
-                    str(warning).startswith(("规格变体", "规格量程", "BLOCK:"))
+                    str(warning).startswith(VARIANT_GUARD_PREFIXES)
                     for warning in item.warnings
                 )
             ]
@@ -665,11 +694,13 @@ def process_job(job_id: str) -> None:
                 if exclusive_eligible
                 else (saitel_eligible if saitel_eligible else eligible)
             )
-            # 名称质量优先（同核心词候选先于变体名），老编号体系 sheet 仅在
+            # 名称质量优先（同核心词候选先于变体名），参数分量次之（同码不同规格
+            # 由此分出先后，注射器 10/50/100mL 不再同价）；老编号体系 sheet 仅在
             # 名称质量相同时做价位 tiebreak（如 压力和压强演示器 9元 优先 22元）；
             # 不能把 老编号 排在 名称质量 前——否则 木直尺(初中物理) 会压过
             # 真正同名的 直尺(1000mm塑料) 候选。
-            default_pool.sort(key=lambda item: (-_name_quality(item), _legacy_sheet_priority(item), -item.score))
+            # 守卫池为空回退到 eligible 时同样按此 key 排序，回退不等于乱选。
+            default_pool.sort(key=lambda item: (-_name_quality(item), -item.component_scores.get("参数", 0), _legacy_sheet_priority(item), -item.score))
             defaults = {item.record["id"] for item in distinct_manufacturer_options(default_pool, job.requested_option_count, min_score=SAITEL_FLOOR)}
             # 默认方案按“同核心词×价位簇”去重：同品同价位只保留一个默认选中，
             # 避免 3 个同价赛特尔方案占满 TOP 区，把不同价位挤到后面。
@@ -695,8 +726,11 @@ def process_job(job_id: str) -> None:
                 candidates,
                 key=lambda item: (
                     item.record["id"] not in defaults,
-                    # 名称质量优先；老编号体系 sheet 仅在同名多价时做价位 tiebreak
+                    # 名称质量优先；参数分量次之（同码不同规格的变体由此排序，
+                    # 报价1 给参数最吻合的记录）；老编号体系 sheet 仅在同名
+                    # 多价时做价位 tiebreak
                     -_name_quality(item),
+                    -item.component_scores.get("参数", 0),
                     _legacy_sheet_priority(item),
                     -item.score,
                 ),
