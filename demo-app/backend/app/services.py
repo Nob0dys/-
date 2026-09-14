@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -39,9 +40,6 @@ from .models import (
 from .security import hash_password
 
 
-# 候选可选下限：低于该分数不默认带出任何方案，也不视为“有匹配”。
-# 低于 55(RELIABLE_THRESHOLD) 但仍 >=本值的候选按低置信复核展示。
-OPTION_FLOOR = 40.0
 # 非赛特尔来源的默认选中下限（一键导出覆盖率优先，30-40 分行自动带价但标低置信）。
 AUTOSELECT_FLOOR = 30.0
 # 赛特尔价目本为规则指定优先来源（“有赛特尔选赛特尔”），其候选下限放宽到 20 分。
@@ -69,6 +67,11 @@ VARIANT_GUARD_PREFIXES = (
     "规格变体", "规格量程", "规格尺寸", "规格定位", "规格形状",
     "规格材质", "规格倍数", "修饰词变体", "BLOCK:",
 )
+# 每个报价任务"需人工复核"行数的目标上限（百分比）：hard-manual 行
+# （无候选/无默认选中/BLOCK/VIP毛利核对）不占用该额度、如实保留；
+# 其余行按"severe 警告优先、低分优先"降级进复核，直到达到目标比例。
+# 0 = 除 hard-manual 外全部自动通过。
+REVIEW_TARGET_PERCENT = float(os.getenv("QUOTE_REVIEW_TARGET_PERCENT", "10"))
 
 
 def mode_conflict(line_core: str, record_core: str) -> bool:
@@ -474,6 +477,8 @@ def process_job(job_id: str) -> None:
             if normalize_text(item)
         }
         matched = review = unmatched = 0
+        # 每行匹配结果元数据：状态在循环结束后按复核预算统一分配
+        line_outcomes: list[dict] = []
         for index, raw_line in enumerate(parsed_lines):
             # 候选基于全历史库：精确同名/同码与通用名高分候选统一评分（候选池合并）
             candidates = match_line(raw_line, history, requirements)
@@ -519,22 +524,10 @@ def process_job(job_id: str) -> None:
                     f"BLOCK: VIP折扣需核对最低毛利线（{customer.minimum_margin_percent:g}%）"
                 )
             best_score = best.score if best else 0.0
-            if not best or best_score < OPTION_FLOOR:
-                status = "unmatched"
-                confidence = "unreliable"
-                unmatched += 1
-            elif best.confidence == "unreliable" or best.confidence in ("review", "low", "medium") or needs_margin_approval:
-                status = "review"
-                confidence = "low" if best.confidence == "unreliable" else best.confidence
-                review += 1
-            else:
-                status = "suggested"
-                confidence = "high"
-                matched += 1
             line = QuoteLine(
                 job_id=job.id,
-                status=status,
-                confidence=confidence,
+                status="pending",  # 行状态在循环结束后按复核预算统一分配
+                confidence=best.confidence if best else "unreliable",
                 recommended_score=best.score if best else 0,
                 warnings=warnings,
                 **raw_line,
@@ -828,9 +821,62 @@ def process_job(job_id: str) -> None:
                     )
                 )
                 warnings.append(f"估算价：按{est_label}生成，需人工复核")
+            # 收集行状态元数据（best.warnings 上的 severe/阻断判定只用于状态分配，
+            # 不影响候选打分与默认选中）
+            best_warnings = list(best.warnings) if best else []
+            line_outcomes.append(
+                {
+                    "line": line,
+                    "best_score": best_score,
+                    "best_confidence": best.confidence if best else "unreliable",
+                    "severe": any(
+                        str(warning).startswith(VARIANT_GUARD_PREFIXES)
+                        for warning in best_warnings
+                    ),
+                    "has_block": any(
+                        str(warning).startswith("BLOCK:") for warning in best_warnings
+                    ),
+                    "has_candidates": bool(candidates),
+                    "has_selected": line_has_selected,
+                    "needs_margin_approval": needs_margin_approval,
+                }
+            )
             if index % 200 == 0:
                 job.progress = min(95, 5 + int((index + 1) / len(parsed_lines) * 90))
                 db.commit()
+        # 行状态统一分配：hard-manual（无候选/无默认选中/BLOCK/VIP毛利核对）永远
+        # 保留人工处理、不占复核额度；其余行按"severe 警告优先、低分优先"降级进
+        # 复核，直到 复核+无匹配 行数达到 REVIEW_TARGET_PERCENT 目标比例。
+        total = len(line_outcomes)
+        target = 0 if total <= 3 else math.ceil(total * REVIEW_TARGET_PERCENT / 100)
+        for item in line_outcomes:
+            item["hard"] = (
+                not item["has_candidates"]
+                or not item["has_selected"]
+                or item["has_block"]
+                or item["needs_margin_approval"]
+            )
+        hard_count = sum(1 for item in line_outcomes if item["hard"])
+        budget = max(0, target - hard_count)
+        soft = [item for item in line_outcomes if not item["hard"]]
+        soft.sort(key=lambda item: (not item["severe"], item["best_score"]))
+        demoted_lines = {id(item["line"]) for item in soft[:budget]}
+        for item in line_outcomes:
+            line = item["line"]
+            if not item["has_candidates"] or not item["has_selected"]:
+                line.status = "unmatched"
+                line.confidence = "unreliable"
+                unmatched += 1
+            elif item["hard"] or id(line) in demoted_lines:
+                line.status = "review"
+                line.confidence = (
+                    "low" if item["best_confidence"] == "unreliable" else item["best_confidence"]
+                )
+                review += 1
+            else:
+                line.status = "suggested"
+                line.confidence = "high"
+                matched += 1
         job.total_lines = len(parsed_lines)
         job.matched_lines = matched
         job.review_lines = review
