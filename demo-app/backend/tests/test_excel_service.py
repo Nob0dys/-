@@ -76,6 +76,20 @@ def test_fuzzy_name_header_minimal_workbook(tmp_path):
     assert lines[0]["pricing_quantity"] == 5
 
 
+def test_repeated_segment_header_rows_are_skipped(tmp_path):
+    """分段报价表数据区重复出现的表头行（名称列="名称"、参数列="规格"）不是产品行。"""
+    path = save_workbook(tmp_path, [
+        ["序号", "名称", "规格", "单位", "数量"],
+        [1, "软尺", "1500mm", "把", 5],
+        [None, "3、小学科学仪器采购清单", None, None, None],
+        ["序号", "名称", "规格", "单位", "数量"],
+        [1, "计算器", "8位", "个", 45],
+    ])
+    lines = parse_quote_workbook(path)
+
+    assert [line["name"] for line in lines] == ["软尺", "计算器"]
+
+
 def test_exact_aliases_win_over_fuzzy_name_matching(tmp_path):
     """制造商名称/规格型号 must not be swallowed by the fuzzy name/spec fallback."""
     path = save_workbook(tmp_path, [

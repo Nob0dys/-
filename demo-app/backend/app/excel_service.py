@@ -51,6 +51,15 @@ def normalize_header_key(value: object) -> str:
     return re.sub(r"[\s\u3000]+", "", str(value or "")).lower()
 
 
+# 字段表头词全集：分段报价表会在数据区重复出现表头行
+# （"序号|名称|规格|单位|数量"），其名称列内容就是表头词本身。
+_HEADER_LABELS = {
+    normalize_header_key(alias)
+    for aliases in HEADER_ALIASES.values()
+    for alias in aliases
+}
+
+
 JY_CODE_RE = re.compile(r"^\d{5}$")
 LINE_CODE_RE = re.compile(r"(?<![\dA-Za-z])([0-8]\d{4})(?![0-9A-Za-z.:+])")
 
@@ -341,6 +350,12 @@ def parse_quote_workbook(path: str) -> list[dict]:
             name = cell_name(ws.cell(row_number, columns["name"]))
             spec = cell_text(ws.cell(row_number, columns["spec"])) if columns["spec"] else ""
             if not name or re.fullmatch(r"(?:小计|合计|总计|配置班额|一般|合计金额)", name):
+                continue
+            # 分段报价表在数据区重复出现的表头行（名称列="名称"、参数列="规格"），
+            # 不是产品行——跳过，避免生成"名称=名称"的空壳行混进"无匹配"。
+            if normalize_header_key(name) in _HEADER_LABELS and (
+                not spec or normalize_header_key(spec) in _HEADER_LABELS
+            ):
                 continue
             if re.match(r"^共\s*\d+", spec) or "配置清单如下" in spec:
                 continue
